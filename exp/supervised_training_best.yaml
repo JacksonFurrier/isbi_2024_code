@@ -1,0 +1,56 @@
+seed: 2022
+
+experiment_name: jps_more_encoding_blocks_dropout2_target_task11
+file_spect_data: spect_data.csv
+folder_volumes: segmentation_xyz
+training_split_ratio: 0.6
+
+augmentation_pipeline:
+  target_shape: !!python/tuple [128, 128, 32]
+  max_displacement: !!python/tuple [8, 8, 0]
+  num_control_points: 10
+
+model:
+  UNet:
+    num_encoding_blocks: 4
+    out_channels_first_layer: 64
+    normalization: instance
+    dropout: 0.25
+
+  pretrained: True
+  experiment_name: jps_more_encoding_blocks_dropout2
+  blocks_to_freeze:
+    - blocks.0
+
+optimizer:
+  learning_rate: 0.01
+
+data_loader:
+  batch_size: 2
+  num_workers: 1
+
+train:
+  num_epochs: 500
+  early_stop: 100
+
+criterion:
+  name: 'dice'
+#  gamma: 0.5          # used only when name='focal'
+
+scheduler:
+  name: 'ExponentialLR'
+  params:
+    gamma: 0.99
+
+neptune:
+  project: ssl-spect-lv-seg
+  api_token: eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiIwZGExNjY4NS1mZjA4LTQ1ZGQtYjM0Yi1jZWJiN2IxOTgzY2YifQ==
+  tags:
+    - supervised
+    - target_task
+    - encoding_blocks_4
+    - out_channels_64
+    - dropout_0.25
+    - jigsaw_puzzle_pretext
+    - dice_loss
+    - freeze_1/3_blocks
