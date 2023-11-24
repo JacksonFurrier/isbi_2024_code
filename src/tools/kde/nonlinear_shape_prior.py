@@ -11,6 +11,9 @@ import mcubes
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+from src.util.timer import tic, toc
+import time
+
 
 def nonlinear_shape_prior(shape_priors, sigma, num_verts):
     """
@@ -103,6 +106,45 @@ def nonlinear_shape_prior_grad(V, kernel, sigma, z_i, z, L, L_ort, r, m):
 
     loss += (L_ort ** (-1)) * par_zz
     return 2.0 * loss
+
+
+def recon_preimg(V, kernel, sigma, x_i, x, r, m):
+    proj_phi_x = torch.zeros([m])
+    for i in range(m):
+        proj_phi_x[i] = kernel(x.double(), x_i[i], sigma)
+        
+    z = x # initial z for optimization, might need a more clever one...
+    z.requires_grad = True
+    
+    def loss(z):
+        sum = 0.0
+        for i in range(m):
+            sum += ((V ** 2)[:, i] * proj_phi_x * kernel(z, x_i[i], sigma)).sum()
+        
+        return -2.0 * sum
+    
+    max_it = 20
+    optimizer = torch.optim.LBFGS([z], max_eval=10, max_iter=10, lr=0.5)
+    
+    history = []
+    print("performing reconstruction optimization...")
+    start = time.time()
+
+    def closure():
+        optimizer.zero_grad()
+        L = loss(z.double())
+        l = L.detach().cpu().numpy()
+        # print("loss", l)
+        history.append(l)
+        L.backward()
+        return L
+
+    for i in range(max_it):
+        print("it ", i, ": ", end="")
+        optimizer.step(closure)
+
+    print("Optimization (L-BFGS) time: ", round(time.time() - start, 2), " seconds")
+    return z
 
 
 def GaussKernel(sigma):

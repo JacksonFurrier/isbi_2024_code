@@ -5,7 +5,7 @@ import torch
 import numpy as np
 
 from src.algs.arm import lv_indicator
-from src.tools.kde.nonlinear_shape_prior import nonlinear_shape_prior_grad
+from src.tools.kde.nonlinear_shape_prior import nonlinear_shape_prior_grad, recon_preimg
 
 # Some thinking is needed in the Mahalanobis distance part
 calc_type = torch.float
@@ -67,7 +67,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
     if u_init is None:
         u = torch.where(Cs >= Ct, 1, 0).float()
     else:
-        u = torch.where(Cs >= Ct, 1, 0).float() # u_init  # start computation from a precomputed prediction
+        u = u_init  # start computation from a precomputed prediction
 
     ps = torch.minimum(Cs, Ct)
     pt = ps
@@ -160,7 +160,6 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
         b_zero = torch.sum((1 - f_one) * im_mod) / (torch.linalg.norm(1 - f_one + norm_epsilon) ** 2)
         b_one = torch.sum(f_one * im_mod) / (torch.linalg.norm(f_one + norm_epsilon) ** 2)
 
-        # pos_grad, pos_fac = nonlinear_shape_prior_grad(u.numpy(), sigma_inv, mean_shape, 52, rows)
         zero_volume_boundary(u, a_width=2)
         vert_vol, tri_vol = mcubes.marching_cubes(u.numpy(), 0.5)
         v_decimate, f_decimate, v_correspondence, f_correspondence = pcu.decimate_triangle_mesh(vert_vol,
@@ -192,9 +191,10 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
         proj_mean.requires_grad = True  # z could require grad, but it takes forever to compute
 
         grad_E = nonlinear_shape_prior_grad(V, k, sigma, z_i, proj_mean, L, sigma_ort, first_cplx, m)
+        rec_prior = recon_preimg(V, k, sigma, z_i, grad_E, first_cplx, m)
 
         f_one = torch.zeros((rows, cols, height))
-        ijk = pcu.voxelize_triangle_mesh(np.reshape(grad_E.detach().numpy(), mean_shape.shape) * rows,
+        ijk = pcu.voxelize_triangle_mesh(np.reshape(rec_prior.detach().numpy(), mean_shape.shape) * rows,
                                          mean_shape_face.astype(np.int32), 1.0, [0., 0., 0.])
         if ijk.ndim == 4:
             f_one[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = 1
