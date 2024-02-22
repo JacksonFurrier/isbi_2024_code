@@ -3,12 +3,16 @@ import point_cloud_utils as pcu
 import mcubes
 import torch
 import numpy as np
+from skimage import measure
+from scipy.spatial.distance import cdist
+from simpleicp import PointCloud, SimpleICP
 
 from src.algs.arm import lv_indicator
-from src.tools.kde.nonlinear_shape_prior import nonlinear_shape_prior_grad, recon_preimg
+from src.tools.kde.nonlinear_shape_prior import E_phi_grad_opt, E_phi_grad
 
 # Some thinking is needed in the Mahalanobis distance part
 calc_type = torch.float
+centering_point = np.array([0.45, 0.45, 0.45])
 
 
 def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_plot=False):
@@ -34,7 +38,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
                      Bit flag to save plot of intermediate results or not
     """
     num_iter, err_bound, gamma, steps = a_opt_params.values()
-    u_init, par_lambda, par_nu, c_zero, c_one, b_zero, b_one, z_i, sigma_inv, L, V, sigma_ort, sigma, first_cplx, min_shape_face_count, mean_shape, mean_shape_face = a_algo_params.values()
+    par_lambda, par_nu, c_zero, c_one, b_zero, b_one, z_i, sigma_inv, L, V, sigma_ort, sigma, first_cplx, min_shape_face_count, mean_shape, mean_shape_face, k_matrix_sum, k_matrix, kernel = a_algo_params.values()
     m = len(z_i)
 
     norm_epsilon = 0.001
@@ -43,7 +47,8 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
     b_zero = c_zero
     b_one = c_one
 
-    lv_volume = a_volume
+    volume = a_volume
+    density_vol = volume / volume.sum()
 
     rows, cols, height = a_volume.shape
     im_size = rows * cols * height
@@ -64,10 +69,8 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
     Cs = (im_eff - c_zero) ** 2
     Ct = (im_eff - c_one) ** 2
 
-    if u_init is None:
-        u = torch.where(Cs >= Ct, 1, 0).float()
-    else:
-        u = u_init  # start computation from a precomputed prediction
+    u_prev = torch.zeros([rows, cols, height])
+    u = torch.where(Cs >= Ct, 1, 0).float()
 
     ps = torch.minimum(Cs, Ct)
     pt = ps
@@ -79,12 +82,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
 
     cmf_iter = 3
     err_iter = torch.zeros(cmf_iter * num_iter, dtype=calc_type)
-
-    from geomloss import SamplesLoss
-    eps = 5 * 1e-2
-    loss = SamplesLoss(loss='sinkhorn', p=2, blur=eps)
-    sigma = 5 * 1e-1
-    k = lambda x, y, sigma: torch.exp(-loss(x, y) / (2 * sigma ** 2))
+    norm_u_iter = torch.zeros(num_iter + 1, dtype=calc_type)
 
     if a_plot is True:
         plt.ion()
@@ -152,6 +150,8 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
                 axis[1, 0].plot(err_iter[0: cmf_iter * i + j])
                 plt.draw()
 
+        norm_u_iter[i + 1] = torch.linalg.norm(u)
+
         c_zero = torch.sum((1 - u) * im_eff) / torch.sum(1 - u)
         c_one = torch.sum(u * im_eff) / (torch.sum(u))
 
@@ -160,49 +160,87 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
         b_zero = torch.sum((1 - f_one) * im_mod) / (torch.linalg.norm(1 - f_one + norm_epsilon) ** 2)
         b_one = torch.sum(f_one * im_mod) / (torch.linalg.norm(f_one + norm_epsilon) ** 2)
 
+        print("u sum: ", u.sum(), "u max: ", u.max(), "u min: ", u.min(), "u count:", (u > 0).sum())
+
         zero_volume_boundary(u, a_width=2)
-        vert_vol, tri_vol = mcubes.marching_cubes(u.numpy(), 0.5)
-        v_decimate, f_decimate, v_correspondence, f_correspondence = pcu.decimate_triangle_mesh(vert_vol,
-                                                                                                tri_vol.astype(
-                                                                                                    np.int32),
-                                                                                                min_shape_face_count)
-        z = torch.from_numpy(v_decimate / rows)
 
-        # transform the current shape to the mean shape
-        x = mean_shape
-        y = z
+        vert_vol, tri_vol, _, _ = measure.marching_cubes(u.numpy(), 0.1)
+        cv, nv, cf, nf = pcu.connected_components(vert_vol, tri_vol.astype(np.int32))
 
-        N, M, D = x.shape[0], y.shape[0], x.shape[1]  # Number of points, dimension
-        p = 2
-        blur = 5 * 1e-2
-
-        OT_solver = SamplesLoss(loss="sinkhorn", p=p, blur=blur, reach=1.41, scaling=0.9, debias=False, potentials=True)
-        F, G = OT_solver(x, y)  # Dual potentials
-
-        x_i, y_j = x.view(N, 1, D), y.view(1, M, D)
-        F_i, G_j = F.view(N, 1), G.view(1, M)
-
-        C_ij = (1 / p) * ((x_i - y_j) ** p).sum(-1)  # (N,M) cost matrix
-        eps = blur ** p  # temperature epsilon
-        P_ij = ((F_i + G_j - C_ij) / eps).exp() / M  # (N,M) transport plan
-
-        # compute gradient w.r.t. to the aligned "mean" shape|
-        proj_mean = torch.reshape(P_ij @ y, mean_shape.shape)
-        proj_mean.requires_grad = True  # z could require grad, but it takes forever to compute
-
-        grad_E = nonlinear_shape_prior_grad(V, k, sigma, z_i, proj_mean, L, sigma_ort, first_cplx, m)
-        rec_prior = recon_preimg(V, k, sigma, z_i, grad_E, first_cplx, m)
+        num_components = nv.size
+        print("Connected components: ", num_components)
+        print("Iteration: ", i, "Norm diff: ", torch.abs(norm_u_iter[i + 1] - norm_u_iter[i]))
 
         f_one = torch.zeros((rows, cols, height))
-        ijk = pcu.voxelize_triangle_mesh(np.reshape(rec_prior.detach().numpy(), mean_shape.shape) * rows,
-                                         mean_shape_face.astype(np.int32), 1.0, [0., 0., 0.])
-        if ijk.ndim == 4:
-            f_one[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = 1
-        fill_value = 1
-        f_one = torch.from_numpy(flip_vals(pcu.flood_fill_3d(f_one, [0, 0, 0], fill_value), 0, 1))
 
-        print("index: ", i, " energy min: ", grad_E.min(), " energy max: ", grad_E.max(), " shape prior count: ",
-              f_one.sum())
+        component = 0
+
+        while (component < num_components) and (torch.abs(norm_u_iter[i + 1] - norm_u_iter[i]) < 0.178) or (
+                i + 1) == num_iter:  # 3 for parallel images
+            nu = 1e-2
+
+            if component >= num_components:
+                break
+
+            if num_components > 1:
+                component_face_count = nf[component]
+            else:
+                component_face_count = nf
+
+            v_decimate, f_decimate, v_correspondence, f_correspondence = \
+                pcu.decimate_triangle_mesh(vert_vol, tri_vol[cf == component].astype(np.int32),
+                                           min(min_shape_face_count.numpy(), component_face_count))
+
+            z = torch.from_numpy(v_decimate / cols)
+            z.requires_grad = True
+
+            # renorm to size 1 and translate it to center_point
+            z_dist = cdist(z.detach().numpy(), z.detach().numpy(), 'euclidean')
+            max_real_size = z_dist.max() * cols
+            if max_real_size <= 20:  # dummy "size" selection 15 for parallel geometries, 20 for mph -> sharpen this
+                print("Skipping object with diameter: ", max_real_size)
+                component = component + 1
+                continue
+
+            z_scaled = z * (1.0 / (z_dist.max()))
+            z_translation = z_scaled.mean(dim=0) - torch.from_numpy(centering_point)
+
+            # Project current shape on the mean shape as in [1]
+            pc_fix = PointCloud(mean_shape.detach().numpy(), columns=["x", "y", "z"])
+            pc_mov = PointCloud((z_scaled - z_translation).detach().numpy(), columns=["x", "y", "z"])
+            icp = SimpleICP()
+            icp.add_point_clouds(pc_fix, pc_mov)
+            H, proj_mean_icp, rigid_body_transformation_params, distance_residuals = icp.run(max_overlap_distance=1)
+            # add reorientation based registration here
+
+            proj_mean = torch.from_numpy(proj_mean_icp)
+            proj_mean.requires_grad = True
+
+            grad_E = E_phi_grad_opt(V, kernel, k_matrix, k_matrix_sum, sigma, z_i, proj_mean, L, sigma_ort, first_cplx,
+                                    m)
+
+            # the last terms in the gradient calculation
+            # d til_z / d_z_c * d_z_c / d_z
+            Rot = H[:-1, :-1]
+            translation = H[:-1, -1]
+
+            it_shape = ((proj_mean - nu * grad_E - torch.from_numpy(translation)) @ torch.from_numpy(
+                Rot) + z_translation) * z_dist.max()
+            print("Translation:", translation, "Normalization factor: ", z_dist.max(), "Mean translation: ",
+                  z_translation)
+
+            # voxelization and bounds checking
+            ijk = pcu.voxelize_triangle_mesh((it_shape).detach().numpy() * cols, f_decimate.astype(np.int32), 1,
+                                             [0., 0., 0.])
+            ijk = ijk[np.sum(np.logical_and(ijk >= 0, ijk < cols), axis=1) == 3, :]
+            ijk = ijk[ijk[:, 0] < rows]  # more likely that the axial dim is different
+
+            f_one[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = 1
+
+            print("component: ", component, " energy min: ", grad_E.min(), " energy max: ", grad_E.max(),
+                  " shape prior count: ", f_one.sum(), " shape prior mean pos:", (it_shape).mean())
+
+            component = component + 1
 
         if a_plot is True:
             plot_obj_seg.set_data(f_one[slice_num, :, :])
@@ -214,10 +252,12 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
 
         im_eff = (par_lambda / (par_lambda + par_nu)) * a_volume + (par_nu / (par_lambda + par_nu)) \
                  * (b_zero * (1 - f_one) + b_one * f_one)
-        Cs = (im_eff - c_zero) ** 2
-        Ct = (im_eff - c_one) ** 2
 
-    return u, err_iter, num_iter
+        H = torch.where(u > 0, 1, 0)
+        Cs = (im_eff - c_zero) ** 2 * torch.kl_div(H * density_vol, (1 - H) * density_vol).sum()
+        Ct = (im_eff - c_one) ** 2 * torch.kl_div((1 - H) * density_vol, H * density_vol).sum()
+
+    return u, err_iter, num_iter, f_one
 
 
 def flip_vals(A, val1, val2):
