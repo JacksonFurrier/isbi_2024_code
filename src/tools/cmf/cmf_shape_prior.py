@@ -38,7 +38,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
                      Bit flag to save plot of intermediate results or not
     """
     num_iter, err_bound, gamma, steps = a_opt_params.values()
-    par_lambda, par_nu, c_zero, c_one, b_zero, b_one, z_i, sigma_inv, L, V, sigma_ort, sigma, first_cplx, min_shape_face_count, mean_shape, mean_shape_face, k_matrix_sum, k_matrix, kernel = a_algo_params.values()
+    u_init, par_lambda, par_nu, c_zero, c_one, b_zero, b_one, z_i, sigma_inv, L, V, sigma_ort, sigma, first_cplx, min_shape_face_count, mean_shape, mean_shape_face, k_matrix_sum, k_matrix, kernel = a_algo_params.values()
     m = len(z_i)
 
     norm_epsilon = 0.001
@@ -68,6 +68,11 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
 
     Cs = (im_eff - c_zero) ** 2
     Ct = (im_eff - c_one) ** 2
+
+    if u_init is None:
+        u = torch.where(Cs >= Ct, 1, 0).float()
+    else:
+        u = u_init  # start computation from a precomputed prediction
 
     u_prev = torch.zeros([rows, cols, height])
     u = torch.where(Cs >= Ct, 1, 0).float()
@@ -175,8 +180,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
 
         component = 0
 
-        while (component < num_components) and (torch.abs(norm_u_iter[i + 1] - norm_u_iter[i]) < 0.178) or (
-                i + 1) == num_iter:  # 3 for parallel images
+        while (i + 1) == num_iter:
             nu = 1e-2
 
             if component >= num_components:
@@ -197,7 +201,7 @@ def cmf_shape_prior(a_volume, a_opt_params, a_algo_params, a_plot=False, a_save_
             # renorm to size 1 and translate it to center_point
             z_dist = cdist(z.detach().numpy(), z.detach().numpy(), 'euclidean')
             max_real_size = z_dist.max() * cols
-            if max_real_size <= 20:  # dummy "size" selection 15 for parallel geometries, 20 for mph -> sharpen this
+            if max_real_size <= 15:  # dummy "size" selection 15 for parallel geometries, 20 for mph -> sharpen this
                 print("Skipping object with diameter: ", max_real_size)
                 component = component + 1
                 continue
